@@ -1,0 +1,1124 @@
+---
+title: "public-ltept-eft"
+author: "Jeremiah Brown"
+format: html
+---
+
+Load packages
+
+```{r}
+#| label: load_packages
+
+library(tidyverse)
+library(qualtRics)
+library(lubridate)
+library(discAUC)
+library(beezdemand)
+library(gtsummary)
+
+```
+
+Load data
+
+```{r}
+#| label: load_data
+
+
+rawdata <- read_csv("data/deidentified-rawdata.csv")
+
+data <- rawdata |>
+  filter(completed == "yes") |> 
+  mutate(across(c(group, condition, order), as.factor))
+
+```
+
+Create dataframes for analyses
+
+```{r}
+# delay discounting data
+dd_data <- data |> 
+  select(id, group, dd_comp:order) |> 
+  pivot_longer(cols = starts_with("ip_"),
+               names_to = "col_name",
+               values_to = "y") %>%
+  extract(col_name, into = "x", regex = "ip_(\\d+)") %>%
+  mutate(x = as.numeric(x))
+
+#ltept data
+ltept_data <- data |> 
+  select(id, group, order, ltept_comp:leisure_time) |> 
+  pivot_longer(cols = ltept_1:ltept_100,
+               names_to = "x",
+               names_prefix = "ltept_",
+               names_transform = list(x = as.double),
+               values_to = "y") 
+
+#demographic data
+demo_data <- data |> 
+  select(id, group, bmi, age, mins_outside, race_1:race_7_TEXT, ethnicity,
+         leisure_time, gender, income = cmbd_income,
+         edu, ex_val_sum, cont_ladder)
+
+# recode income into smaller categories to decrease the space taken up in table,
+# then relevel orders of the factor variable
+demo_data <- demo_data |> 
+  mutate(income = case_when(
+    income == "Less than $9,999" ~ "Less than $29,999",
+    income == "$10,000 through $29,999" ~ "Less than $29,999",
+    income == "$30,000 through $49,999" ~ "$30,000 through $69,999",
+    income == "$50,000 through $69,999" ~ "$30,000 through $69,999",
+    income == "$70,000 through $89,999" ~ "$70,000 through $109,999",
+    income == "$90,000 through $109,999" ~ "$70,000 through $109,999",
+    income == "$110,000 though $139,999" ~ "$110,000 through $179,999",
+    income == "$140,000 through $179,999" ~ "$110,000 through $179,999",
+    income == "$180,000 through $199,999" ~ "$180,000 and greater",
+    income == "$200,000 and greater" ~ "$180,000 and greater",
+    income == "Refuse to answer" ~ "Refuse to answer"
+  )) |> 
+  mutate(income = fct_relevel(
+    .f = income, "Less than $29,999","$30,000 through $69,999",
+                  "$70,000 through $109,999", "$110,000 through $179,999",
+                  "$180,000 and greater", "Refuse to answer"))
+
+# also recode gender to remove the please specify
+demo_data <- demo_data |> 
+  mutate(gender = case_when(
+           gender == "Male" ~ "Male",
+           gender == "Female" ~ "Female",
+           gender == "Other (please specify)" ~ "Other",
+           )) 
+  
+#create a single variable for race
+demo_data <- demo_data |> 
+         mutate(race = case_when(
+           race_1 == "American Indian or Alaskan Native" ~ "American Indian or Alaskan Native",
+           race_2 == "Asian" ~ "Asian",
+           race_3 == "Black or African American" ~ "Black",
+           race_5 == "White" ~ "White", 
+           race_7 == "Other (please specify)" ~ "Other",
+           ))
+
+demo_data <- 
+  labelVector::set_label(demo_data,
+            age = "Age",
+            income = "Income",
+            gender = "Gender",
+            edu = "Education",
+            race = "Race",
+            bmi = "BMI",
+            leisure_time = "Weekly Leisure Time (hrs)",
+            ex_val_sum = "Exercise value (Likert)",
+            ethnicity = "Ethnicity")
+
+
+```
+
+Analyze IPAQ responses
+
+```{r}
+#|label: ipaq
+
+betteripaq <- function(data) {
+  ## rename some shit
+  colnames(data) <- c("id", "weight", "VigDays", "VigHours", 
+                      "VigMin", "ModDays", "ModHours", "ModMin", 
+                      "WalkDays", "WalkHours", "WalkMin", "SitHours", "SitMin")
+  vminday <- data$VigHours * 60 + data$VigMin
+  mminday <- data$ModHours * 60 + data$ModMin
+  wminday <- data$WalkHours * 60 + data$WalkMin
+  sminday <- data$SitHours * 60 + data$SitMin
+  vminwk <- data$VigDays * vminday
+  mminwk <- data$ModDays * mminday
+  wminwk <- data$WalkDays * wminday
+  sminwk <- sminday * 7
+  sumpa <- vminday + mminday + wminday
+  sumday <- data$VigDays + data$ModDays + data$WalkDays
+  data$excMin <- ifelse(sumpa > 960, 1, 0)
+  data$excDay <- ifelse(sumday > 9, 1, 0)
+  vminday <- ifelse(vminday < 10, 0, vminday)
+  mminday <- ifelse(mminday < 10, 0, mminday)
+  wminday <- ifelse(wminday < 10, 0, wminday)
+  vminwkMET = 8 * vminwk
+  mminwkMET = 4 * mminwk
+  wminwkMET = 3.3 * wminwk
+  MET = vminwkMET + mminwkMET + wminwkMET
+  kilocalories = MET * (data$weight/60)
+  data$MET <- MET
+  data$kilocalories <- kilocalories
+  data$pacat[data$VigDays >= 3 & vminday >= 20] <- "Moderate"
+  data$pacat[data$ModDays >= 5] <- "Moderate"
+  data$pacat[wminday >= 30] <- "Moderate"
+  data$pacat[(data$VigDays + data$ModDays + data$WalkDays) >= 
+               5 & MET >= 600] <- "Moderate"
+  data$pacat[data$VigDays >= 3 & MET >= 1500] <- "High"
+  data$pacat[(data$VigDays + data$ModDays + data$WalkDays) >= 
+               7 & MET >= 3000] <- "High"
+  data$pacat[is.na(data$pacat)] <- "Low"
+  data$pacat[is.na(data$VigDays) & is.na(data$VigHours) & 
+               is.na(data$VigMin) & is.na(data$ModDays) & is.na(data$ModHours) & 
+               is.na(data$ModMin) & is.na(data$WalkDays) & is.na(data$WalkHours) & 
+               is.na(data$WalkMin)] <- NA
+  rownames(data) <- NULL
+  data
+}
+
+#ipaq data
+ipaq_data <- data |> 
+  select(id, weight, vig_days_1:sit_time_4) |> 
+  mutate(across(weight:sit_time_4, as.numeric),
+         weight = weight/2.2) |>
+  betteripaq() 
+  
+  
+```
+
+Demographics Table
+
+```{r}
+#| label: demographics_table
+
+#create table one using gtsummary
+tableone <- demo_data |> 
+  select(Group = group, age, bmi, leisure_time, race,
+         ethnicity, gender, income, edu) |> 
+  mutate(Group = case_when(
+    Group == "hit" ~ "HIT",
+    Group == "eft" ~ "EFT"
+  ),
+  leisure_time = leisure_time/60) |> 
+  tbl_summary(by = Group,
+    statistic = list(all_continuous() ~ "{median} ({p25}, {p75})",
+                     all_categorical() ~ "{n} / {N} ({p}%)"),
+    digits = all_continuous() ~ 2,
+  ) |> 
+  bold_labels() |>  
+  modify_header(label = "**Variable**") |>  
+  modify_spanning_header(c("stat_1", "stat_2") ~ "**Group**") 
+
+#compact theme
+theme_gtsummary_compact()
+
+# save table one
+# tableone |>
+#   as_gt() |>
+#   gt::gtsave(filename = "plots/tableone.png")
+
+
+```
+
+Examine DD and Demand Attention/Comprehension Checks, Systematicity
+
+```{r}
+#|label: ac/comp_checks
+
+# delay discounting attention check
+dd_ac_passing_ids <- dd_data |> 
+  filter(dd_ac >= .75) |> # correctly answered 3/4 attention checks
+  distinct(id) |> 
+  pull() |> 
+  as.integer()
+
+# dd comprehension check
+dd_cc_passing_ids <- dd_data |> 
+  filter(dd_comp == 1) |>
+  distinct(id) |> 
+  pull() |> 
+  as.integer()
+
+# ltept comprehension check
+ltept_cc_passing_ids <- ltept_data |> 
+  filter(ltept_comp == 1) |> 
+  distinct(id) |> 
+  pull() |> 
+  as.integer()
+
+# ltept systematicity
+ltept_sys_passing_ids <- ltept_data |> 
+  CheckUnsystematic() |> 
+  filter(TotalPass == 3 | NumPosValues == 0) |> 
+  pull(id) |> 
+  as.integer()
+
+# identify flat 100 responses (none)
+data |> 
+  select(id, ltept_1:ltept_100) |> 
+  filter(across(ltept_1:ltept_100, ~ . == 100))
+
+# identify flat zero responses
+ltept_zero_ids <- data |> 
+  select(id, ltept_1:ltept_100) |> 
+  filter(across(ltept_1:ltept_100, ~ . == 0)) |> 
+  pull(id) |> 
+  as.integer()
+
+```
+
+Delay Discounting Analyses
+
+```{r}
+#|label: delay_discounting
+
+#create df of ordinal auc values
+dd_ord <- dd_data |> 
+  prep_ordinal(x_axis = "x",
+               groupings = "id") |> 
+  AUC(indiff = "y",
+      x_axis = "x_ord",
+      max_x_axis = 7,
+      amount = 1000,
+      groupings = c("id", "group", "order", "dd_ac", "dd_comp"),
+      type = "ordinal") |> 
+  ungroup()
+
+#view summary stats
+dd_ord |> 
+  group_by(group) |> 
+  summarise(mn_AUC = mean(AUC),
+            md_AUC = median(AUC),
+            sd_AUC = sd(AUC),
+            iqr_aur = IQR(AUC),
+            mn_AttChk = mean(dd_ac),
+            n = n())
+
+#test normality of the distribution of ordinal AUC
+dd_ord |> 
+  ggplot(aes(y = (AUC))) +
+  geom_histogram()
+
+#this means normal. fail to reject (i.e., accept) the null that the data are not skewed
+moments::agostino.test(x = dd_ord |>
+                         pull(AUC),
+  alternative = c("t"))
+
+#however, different interpretation of shapiro-wilk test. indicates not normal. 
+stats::shapiro.test(dd_ord |> pull(AUC))
+
+#ancova controlling for order, removing AC and CC fails
+#use type 3 sum of squares
+auc_anova_res <- dd_ord |> 
+  left_join(x = _, y = demo_data |> 
+              select(id, income), by = "id") |> 
+  filter(id %in% dd_ac_passing_ids & id %in% dd_cc_passing_ids) |>
+  lm(AUC ~ group + order, data = _) |> 
+  car::Anova(mod = _, type = 3)
+
+#effect size, partial eta squared
+auc_anova_res$pes <- c(auc_anova_res$'Sum Sq'[-nrow(auc_anova_res)], NA)/
+  (auc_anova_res$'Sum Sq' + auc_anova_res$'Sum Sq'[nrow(auc_anova_res)]) # SS for each effect divided by the last SS (SS_residual)
+
+#aov with main effect of group and order
+summary(aov(AUC ~ group + order,
+    dd_ord |> 
+      filter(id %in% dd_cc_passing_ids & id %in% dd_ac_passing_ids)))
+
+#nonparametric equivalent
+dd_ord |> 
+  left_join(x = _, y = demo_data |> 
+              select(id, income), by = "id") |> 
+  wilcox.test(data = _, AUC ~ group)
+
+#standard error/means
+Rmisc::summarySE(data = dd_ord |> 
+                   filter(id %in% dd_cc_passing_ids & id %in% dd_ac_passing_ids),
+                 measurevar = "AUC",
+                 groupvars = "group")
+
+Rmisc::summarySE(data = dd_ord, 
+                 measurevar = "AUC",
+                 groupvars = "group")
+
+
+```
+
+Ordinal Delay Discounting Curves and AUC Boxplot - Mean and Individual
+
+```{r}
+#| label: discounting_curves
+
+#calculate summary stats for each group, including all participants
+dd_summary_data <- dd_data |> 
+  Rmisc::summarySE(
+    data = _,
+    measurevar = "y",
+    groupvars = c("group", "x")
+  ) |> 
+  rename(mn = y) |> 
+  as_tibble() |> 
+  prep_ordinal(x_axis = "x",
+               groupings = "group") |> 
+  rename(Group = group) |> 
+  mutate(Group = case_when(
+    Group == "hit" ~ "HIT",
+    Group == "eft" ~ "EFT"
+  ))
+
+#calc number of participants in each group who completed DD
+# eft
+n_dd_eft_curves <- dd_data |> 
+  distinct(id, group) |> 
+  group_by(group) |> 
+  summarise(n = n()) |> 
+  filter(group == "eft") |> 
+  pull(n)
+
+#hit
+n_dd_hit_curves <- dd_data |> 
+  distinct(id, group) |> 
+  group_by(group) |> 
+  summarise(n = n()) |> 
+  filter(group == "hit") |> 
+  pull(n)
+
+#calculate summary stats for each group, including only passing participants
+dd_summary_data_passed <- dd_data |> 
+  filter(dd_ac >= .75 & dd_comp == 1) |> # filter out poor quality responses
+  Rmisc::summarySE(
+    data = _,
+    measurevar = "y",
+    groupvars = c("group", "x")
+  ) |> 
+  rename(mn = y) |> 
+  as_tibble() |> 
+  prep_ordinal(x_axis = "x",
+               groupings = "group") |> 
+  rename(Group = group) |> 
+  mutate(Group = case_when(
+    Group == "hit" ~ "HIT",
+    Group == "eft" ~ "EFT"
+  ))
+
+#calc number of participants in each group who completed DD who passed AC and CC
+# eft
+n_dd_eft_curves_passed <- dd_data |> 
+  filter(dd_ac >= .75 & dd_comp == 1) |> # filter out poor quality responses
+  distinct(id, group) |> 
+  group_by(group) |> 
+  summarise(n = n()) |> 
+  filter(group == "eft") |> 
+  pull(n)
+
+#hit
+n_dd_hit_curves_passed <- dd_data |> 
+  filter(dd_ac >= .75 & dd_comp == 1) |> # filter out poor quality responses
+  distinct(id, group) |> 
+  group_by(group) |> 
+  summarise(n = n()) |> 
+  filter(group == "hit") |> 
+  pull(n)
+
+#specify colors for plots
+colors <- bind_cols(ggsci::pal_lancet("lanonc")(2), c("EFT", "HIT")) |> 
+  rename(color = ...1,
+         group = ...2)
+
+color_eft <- colors |> 
+  filter(group == "EFT") |> 
+  dplyr::pull(color)
+
+color_hit <- colors |> 
+  filter(group == "HIT") |> 
+  dplyr::pull(color)
+
+
+# create plot containing mean indiff points on ordinal x axis, with se
+#including ALL RESPONSES
+mean_dd_plot <- dd_summary_data |> 
+  ggplot(aes(x = x_ord, y = mn, group = Group, color = Group)) + 
+  geom_line(linewidth = 1) +
+  geom_point(aes(x = x_ord, y = mn), size = 2, position = position_dodge(.05)) +
+  geom_errorbar(aes(x = x_ord, y = mn,
+                    ymin = mn - se,
+                    ymax = mn + se), size = .5,
+                width = .15, position = position_dodge(.05)) +
+    labs(title = "Average Indifference Points by Group",
+         x = "Delay (ordinal)", y = "Indifference Point ($)",
+                  subtitle = bquote(italic(n)*" EFT"~"="~.(n_dd_eft_curves)*";"~italic(n)*" HIT"~"="~.(n_dd_hit_curves))) +
+    beezdemand::theme_apa() +
+    theme(legend.key.size = unit(1.5, "cm"),
+          legend.background = element_rect(color = "black",
+                                           fill = scales::alpha("white", .1),
+                                           linetype = "solid"),
+          legend.key = element_rect(fill ="white"),
+          legend.position = c(.8, 1),
+          legend.direction = "horizontal",
+          legend.title = element_text(face = "bold")) +
+    scale_x_continuous(breaks=c(1, 2, 3, 4, 5, 6, 7),
+    labels = c("30 days", "90 days", "180 days", "365 days", "1095 days", "1825 days", "3650 days")) + # trans = 'log10')  +
+    ggsci::scale_color_lancet(name = "Group")
+
+# ggsave("plots/dd_group_mean_ordinal_curves.png",
+#        plot = last_plot(),
+#        device = "png",
+#        dpi = 1000,
+#        height = 10,
+#        width = 14)
+
+### individual DD curves
+dd_data |> 
+  prep_ordinal(dat = _,
+               x_axis = "x",
+               groupings = "id") |>
+  rename(Group = group) |> 
+  mutate(Group = case_when(
+    Group == "hit" ~ "HIT",
+    Group == "eft" ~ "EFT"
+  )) |> 
+  filter(dd_ac >= .75 & dd_comp == 1) |> # filter out poor quality responses
+  ggplot(aes(x = x_ord, y = y, group = id, color = Group)) +
+  geom_line(alpha = 0.5) + 
+  labs(title = "Individual Indifference Points by Group",
+         x = "Delay (ordinal)", y = "Indifference Point ($)",
+                  subtitle = bquote(italic(n)*" EFT"~"="~.(n_dd_eft_curves_passed)*";"~italic(n)*" HIT"~"="~.(n_dd_hit_curves_passed))) +
+    beezdemand::theme_apa() +
+    theme(legend.key.size = unit(1.5, "cm"),
+          legend.background = element_rect(color = "white",
+                                           fill = scales::alpha("white", .5),
+                                           linetype = "solid"),
+          legend.key = element_rect(fill ="white"),
+          legend.position = c(.8, 1),
+          legend.direction = "horizontal",
+          legend.text = element_text(size = 12),
+          legend.title = element_text(size = 16)) +
+    scale_x_continuous(breaks=c(1, 2, 3, 4, 5, 6, 7),
+    labels = c("30 days", "90 days", "180 days", "365 days", "1095 days", "1825 days", "3650 days")) + # trans = 'log10')  +
+    ggsci::scale_color_lancet(name = "Group") +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+  
+# ggsave("plots/individual_ordinal_dd_curves.png",
+#        plot = last_plot(),
+#        device = "png",
+#        dpi = 1000,
+#        height = 10,
+#        width = 14)
+
+## EFT DD curves plot, individual and mean, ALL RESPONSES
+eft_ind_plot <- dd_data |> 
+  filter(group == "eft") |> 
+  prep_ordinal(dat = _,
+               x_axis = "x",
+               groupings = "id") |>
+  rename(Group = group) |> 
+  mutate(Group = case_when(
+    Group == "eft" ~ "EFT"
+  )) |> 
+  ggplot(aes(x = x_ord, y = y, group = id, color = Group)) +
+  geom_line(alpha = 0.25) + 
+  geom_line(aes(x = x_ord, y = mn, group = Group, color = Group),
+            data = dd_summary_data |> 
+              filter(Group == "EFT"), linewidth = 1) +
+  geom_point(aes(x = x_ord, y = mn, group = Group, color = Group), 
+             data = dd_summary_data |>
+               filter(Group == "EFT"), 
+             size = 2) +
+  geom_errorbar(aes(x = x_ord, y = mn, group = Group, color = Group,
+                    ymin = mn - se,
+                    ymax = mn + se),
+                data = dd_summary_data |> 
+                  filter(Group == "EFT"), size = .5,
+                width = .15) +
+  labs(title = "Average and Individual Indifference Points - EFT",
+         x = "Delay (ordinal)", y = "Indifference Point ($)",
+                  subtitle =
+         bquote(italic(n)*~"="~.(n_dd_eft_curves))) +
+    beezdemand::theme_apa() +
+    theme(legend.position = "none") +
+    scale_x_continuous(breaks=c(1, 2, 3, 4, 5, 6, 7),
+    labels = c("30 days", "90 days", "180 days", "365 days", "1095 days", "1825 days", "3650 days")) + # trans = 'log10')  +
+    scale_color_manual(values = c("EFT" = color_eft), name = "Group") +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+
+## HIT DD curves plot, individual and mean, ALL RESPONSES
+hit_ind_plot <- dd_data |> 
+  filter(group == "hit") |> 
+  prep_ordinal(dat = _,
+               x_axis = "x",
+               groupings = "id") |>
+  rename(Group = group) |> 
+  mutate(Group = case_when(
+    Group == "hit" ~ "HIT"
+  )) |> 
+  ggplot(aes(x = x_ord, y = y, group = id, color = Group)) +
+  geom_line(alpha = 0.25) + 
+  geom_line(aes(x = x_ord, y = mn, group = Group, color = Group),
+            data = dd_summary_data |> 
+              filter(Group == "HIT"), linewidth = 1) +
+  geom_point(aes(x = x_ord, y = mn, group = Group, color = Group), 
+             data = dd_summary_data |>
+               filter(Group == "HIT"), 
+             size = 2) +
+  geom_errorbar(aes(x = x_ord, y = mn, group = Group, color = Group,
+                    ymin = mn - se,
+                    ymax = mn + se),
+                data = dd_summary_data |> 
+                  filter(Group == "HIT"), size = .5,
+                width = .15) +
+  labs(title = "Average and Individual Indifference Points - HIT",
+         x = "Delay (ordinal)", y = "Indifference Point ($)",
+                  subtitle =
+         bquote(italic(n)*~"="~.(n_dd_hit_curves))) +
+    beezdemand::theme_apa() +
+    theme(legend.position = "none") +
+    scale_x_continuous(breaks=c(1, 2, 3, 4, 5, 6, 7),
+    labels = c("30 days", "90 days", "180 days", "365 days", "1095 days", "1825 days", "3650 days")) + # trans = 'log10')  +
+    scale_color_manual(values = c("HIT" = color_hit), name = "Group") +
+    guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+
+#combined plot
+ggpubr::ggarrange(
+  mean_dd_plot,
+  ggpubr::ggarrange(eft_ind_plot, hit_ind_plot, 
+            ncol = 2, labels = c("B", "C")),
+  nrow = 2, labels = "A")
+
+# ggsave("plots/ordinal-dd-curves-all.png", 
+#        device = "png",
+#        dpi = 300,
+#        height = 8,
+#        width = 12)
+
+```
+
+Ordinal AUC Boxplot
+
+```{r}
+#|label: ord_auc_boxplot
+
+#create boxplot of ordinal AUC values by group, including all AUC data
+
+dd_ord |> 
+  rename(Group = group) |> 
+  mutate(Group = case_when(
+    Group == "hit" ~ "HIT",
+    Group == "eft" ~ "EFT"
+  )) |>
+  ggplot(aes(x = Group, y = AUC, group = Group, color = Group)) +
+  geom_boxplot(notch = TRUE) +
+  geom_jitter(aes(color = Group), alpha = .5, position =
+                position_jitterdodge(jitter.width = .5)) +
+  theme_apa() +
+  labs(title = "Boxplot of Ordinal AUC values by Group",
+       y = "Ordinal AUC",
+       subtitle = bquote(italic(n)*" EFT"~"="~.(n_dd_eft_curves)*";"~italic(n)*" HIT"~"="~.(n_dd_hit_curves))) +
+  theme(legend.key = element_rect("white"),
+        legend.key.size = unit(1.5, "cm"),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 16)) +
+      ggsci::scale_color_lancet(name = "Group") 
+
+# ggsave("plots/boxplot_ordinal_auc.png",
+#        plot = last_plot(),
+#        device = "png",
+#        dpi = 300,
+#        height = 10,
+#        width = 14)
+
+```
+
+Demand Analyses
+
+```{r}
+#| label: demand_analyses
+
+#descriptives of passing responses
+ltept_data |> 
+  filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids) |>
+  GetDescriptives()
+
+#fit demand curves to koff equation
+# remove zero responses; can't fit curves to flat lines
+ltept_fits <- ltept_data |> 
+  filter(!id %in% ltept_zero_ids) |> 
+  FitCurves("koff", 
+            detailed = TRUE,
+            xcol = "x", 
+            ycol = "y",
+            idcol = "id",
+            hibound = c("q0" = 100, "alpha" = Inf))
+
+ltept_zero_fits <- map_df(ltept_zero_ids, function(id) {
+  data.frame(
+    id = id,
+    BP1 = 0,
+    Pmaxe = 0, 
+    Q0d = 0,
+    Alpha = NA
+  )
+})
+
+
+#we must now bind the zero responses to the main ltept df, to include them in 
+#subsequent 2 stage analyses. include all responses. 
+demand_df <- bind_rows(
+  ltept_fits$dfres |> 
+    mutate(id = as.numeric(id)) |> 
+    left_join(x = _, y = data |> 
+              select(id, group, condition, order) |> 
+              mutate(id = as.double(id)), by = "id") |>
+  select(id, group, condition, order, Q0d, Alpha, BP1, Pmaxe, R2, Notes),
+  ltept_zero_fits |> 
+    left_join(data |>
+      filter(id %in% ltept_zero_ids) |> 
+      select(id, group, condition, order),
+    by = "id")) |> 
+  mutate(log_alpha = log(Alpha))
+
+#identify negative alpha value responses
+neg_alpha_id <- demand_df |> 
+  filter(Alpha <= 0) |> 
+  pull(id)
+
+demand_df |> 
+  filter(id %in% neg_alpha_id)
+
+#standard error/means, log Alpha
+Rmisc::summarySE(data = demand_df |>
+                   drop_na(), 
+                 measurevar = "log_alpha",
+                 groupvars = "group")
+
+#sensitivity analysis
+Rmisc::summarySE(data = demand_df |> 
+                   filter(id %in% ltept_cc_passing_ids &
+                            id %in% ltept_sys_passing_ids) |> 
+                   drop_na(),
+                 measurevar = "log_alpha",
+                 groupvars = "group")
+
+#standard error/means, Q0d
+Rmisc::summarySE(data = demand_df, 
+                 measurevar = "Q0d",
+                 groupvars = "group")
+
+#sensitivity analysis
+Rmisc::summarySE(data = demand_df |> 
+                   filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids),
+                 measurevar = "Q0d",
+                 groupvars = "group")
+
+#median R2 in each group, and for all folks/sensitivity analysis
+demand_df |> 
+  group_by(group) |> 
+  drop_na() |> 
+  summarize(med_r2 = median(R2))
+
+#sensitivity analysis R2
+demand_df |> 
+  filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids) |> 
+  group_by(group) |> 
+  drop_na() |> 
+  summarize(med_r2 = median(R2))
+
+#examine normality of Q0d and Alpha in each group
+moments::agostino.test(x = log(ltept_fits$dfres$Alpha),
+  alternative = c("t"))
+
+moments::agostino.test(x = log(demand_df |> 
+                                 filter(id %in% ltept_cc_passing_ids &
+                                          id %in% ltept_sys_passing_ids) |> 
+                                 select(Alpha) |> 
+                                 pull()),
+  alternative = c("t"))
+
+ltept_fits$dfres |> 
+  mutate(id = as.numeric(id)) |> 
+  left_join(x = _, y = data |> 
+              select(id, group, condition, order, ltept_comp, leisure_time) |> 
+              mutate(id = as.double(id)), by = "id") |> 
+  filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids) |> 
+  ggplot(aes(x = group, y = log(Alpha), color = group, group = group)) +
+  geom_boxplot() +
+  facet_wrap(~order)
+
+#indices as a function of group, while controlling for condition and order
+#including all participants 
+alpha_aov <- demand_df |> 
+  aov(log_alpha ~ group + condition + order, data = _) |> 
+  car::Anova(mod = _, type = 3)
+
+#effect size, partial eta squared
+alpha_aov$pes <- c(alpha_aov$'Sum Sq'[-nrow(alpha_aov)], NA)/
+  (alpha_aov$'Sum Sq' + alpha_aov$'Sum Sq'[nrow(alpha_aov)]) # SS for each effect divided by the last SS (SS_residual)
+
+q0d_aov <- demand_df |> 
+  aov(Q0d ~ group + condition + order, data = _) |> 
+  car::Anova(mod = _, type = 3)
+
+#effect size, partial eta squared
+q0d_aov$pes <- c(q0d_aov$'Sum Sq'[-nrow(q0d_aov)], NA)/
+  (q0d_aov$'Sum Sq' + q0d_aov$'Sum Sq'[nrow(q0d_aov)]) # SS for each effect divided by the last SS (SS_residual)
+
+#indices as a function of group, while controlling for condition and order
+#sensitivity analyses, remove low quality data
+alpha_aov_sens <- demand_df |> 
+  filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids &
+           !id %in% neg_alpha_id) |>
+  aov(log_alpha ~ group + condition + order, data = _) |> 
+  car::Anova(mod = _, type = 3)
+
+#effect size, partial eta squared
+alpha_aov_sens$pes <- c(alpha_aov_sens$'Sum Sq'[-nrow(alpha_aov_sens)], NA)/
+  (alpha_aov_sens$'Sum Sq' + alpha_aov_sens$'Sum Sq'[nrow(alpha_aov_sens)]) # SS for each effect divided by the last SS (SS_residual)
+
+q0d_aov_sens <- demand_df |> 
+  filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids) |>
+  aov(Q0d ~ group + condition + order, data = _) |> 
+  car::Anova(mod = _, type = 3)
+
+#effect size, partial eta squared
+q0d_aov_sens$pes <- c(q0d_aov_sens$'Sum Sq'[-nrow(q0d_aov_sens)], NA)/
+  (q0d_aov_sens$'Sum Sq' + q0d_aov_sens$'Sum Sq'[nrow(q0d_aov_sens)]) # SS for each effect divided by the last SS (SS_residual)
+
+
+#check assumptions of model
+# ltept_fits$dfres |> 
+#   mutate(id = as.numeric(id)) |> 
+#   left_join(x = _, y = data |> 
+#               select(id, group, condition, order, ltept_comp, leisure_time) |> 
+#               mutate(id = as.double(id)), by = "id") |> 
+#   filter(id %in% ltept_cc_passing_ids & id %in% ltept_sys_passing_ids) |> 
+#   lm(Pmaxe ~ group + condition + order, data = _) |> 
+#   performance::check_model()  
+  
+
+# summary stats of alpha and qod, as a function of group
+# to include all stats, I must bind in the 0 probability demand indices df
+#this is filtered; should include all responses
+bind_rows(
+  ltept_fits$dfres |> 
+  mutate(id = as.numeric(id)) |> 
+  left_join(x = _, y = data |> 
+              select(id, group) |> 
+              mutate(id = as.double(id)), by = "id") |>
+  select(id, group, Q0d, Alpha, BP1, Pmaxe),
+  ltept_zero_fits |> 
+    left_join(data |>
+      filter(id %in% ltept_zero_ids) |> 
+      select(id, group),
+    by = "id"))  |> 
+  group_by(group) |> 
+  summarise(n = n(),
+            mn_q0d = mean(Q0d),
+            md_q0d = median(Q0d),
+            sd_q0d = sd(Q0d),
+            iqr_q0d = IQR(Q0d),
+            mn_alpha = mean(Alpha, na.rm = TRUE),
+            md_alpha = median(Alpha, na.rm = TRUE),
+            sd_alpha = sd(Alpha, na.rm = TRUE),
+            iqr_alpha = IQR(Alpha, na.rm = TRUE),
+            mn_bp1 = mean(BP1),
+            md_bp1 = median(BP1),
+            sd_bp1 = sd(BP1),
+            iqr_bp1 = IQR(BP1),
+            mn_pmax = mean(Pmaxe),
+            md_pmax = median(Pmaxe),
+            sd_pmax = sd(Pmaxe),
+            iqr_pmax = IQR(Pmaxe)) |> 
+  t() |>
+  as.data.frame() |> 
+  rownames_to_column() |>  
+  rempsyc::nice_table() |>   # code to turn this into a nice table
+  # flextable::save_as_docx(
+  # path = "plots/demand-indices-summary-table-spare.docx")
+
+#peek at distributions of Q0d and alpha, including log and sqrt transformations
+# ltept_fits$dfres |> 
+#   mutate(alpha_log = log(Alpha),
+#          alpha_sqrt = sqrt(Alpha),
+#          q0d_log = log(Q0d),
+#          q0d_sqrt = sqrt(Q0d)) |> 
+#   ggplot(aes(x = Alpha)) +
+#   geom_histogram()
+
+#count number of observations in each index by group
+bind_rows(
+  ltept_fits$dfres |> 
+  mutate(id = as.numeric(id)) |> 
+  left_join(x = _, y = data |> 
+              select(id, group) |> 
+              mutate(id = as.double(id)), by = "id") |>
+  select(id, group, Q0d, Alpha, BP1, Pmaxe),
+  ltept_zero_fits |> 
+    left_join(data |>
+      filter(id %in% ltept_zero_ids) |> 
+      select(id, group),
+    by = "id"))  |> 
+  group_by(group) |> 
+  summarize(across(everything(), ~ sum(!is.na(.), na.rm = TRUE)))
+
+#d'agostino test to see if transformation improve normality
+#untransformed alpha = skewed (obvious by visual inspection as well)
+moments::agostino.test(x = ltept_fits$dfres$Alpha,
+  alternative = c("t"))
+
+#even log transformated alpha is still skewed, but better than untransformed
+moments::agostino.test(x = ltept_fits$dfres |> 
+                         mutate(log_alpha = log(Alpha)) |> 
+                         select(log_alpha) |> 
+                         pull(log_alpha),
+  alternative = c("t"))
+
+```
+
+Individual Demand Curves
+
+```{r}
+#| label: ind_demand_curves
+
+#calc number of curves in each group
+#eft, removing two ids with negative alpha values who were not included in any
+#alpha values due to log transformations
+n_eft_curves <- ltept_fits$dfres |> 
+  mutate(id = as.numeric(id)) |> 
+  left_join(x = _, y = data |> 
+              select(id, group, condition, order, ltept_comp, leisure_time) |> 
+              mutate(id = as.double(id)), by = "id") |>
+  filter(!id %in% neg_alpha_id) |>
+  group_by(group) |> 
+  summarize(n = n()) |> 
+  filter(group == "eft") |> 
+  pull(n)
+
+#hit
+n_hit_curves <- ltept_fits$dfres |> 
+  mutate(id = as.numeric(id)) |> 
+  left_join(x = _, y = data |> 
+              select(id, group, condition, order, ltept_comp, leisure_time) |> 
+              mutate(id = as.double(id)), by = "id") |>
+  filter(!id %in% neg_alpha_id) |>
+  group_by(group) |> 
+  summarize(n = n()) |> 
+  filter(group == "hit") |> 
+  pull(n)
+  
+
+#lt-ept individual curves, by group assignment
+#removing the two ids that have negative alphas
+plot <- ltept_fits$newdats |> 
+  imap_dfr(~ tibble(name = .y, select(.x, id, x, y))) |>
+  rename(id2 = id, id = name) |>
+  left_join(x = _, y = ltept_fits$adfs |>
+              map_dfr(~ select(.x, id, Group = group, condition, order) |> 
+                      mutate(id = as.character(id),
+                             Group = case_when(Group == "hit" ~ "HIT",
+                                               Group == "eft" ~ "EFT")) |> 
+                        distinct()),
+  by = "id") |> 
+  filter(!id %in% neg_alpha_id) |>
+  ggplot(aes(x = x, y = y, Group = id, color = Group, tooltip = id, data_id = id)) +
+  geom_line(alpha = .5) +
+  coord_trans(x = "log10", xlim = c(1, 100),
+              ylim = c(0.1, 105)) +
+  scale_x_continuous(breaks = c(1, 1, 10, 100, 250),
+                labels = c("1", "1", "10", "100", "250")) +
+  scale_y_continuous(expand = c(.05, .05)) +
+  labs(x = "Leisure Time Traded for Exercise (%)",
+       y = "Likelihood of Trade",
+       title = "Leisure-time as Price Exercise Purchase Task (LT-EPT)",
+       subtitle = bquote(italic(n)*" EFT"~"="~.(n_eft_curves)*";"~italic(n)*" HIT"~"="~.(n_hit_curves))) + 
+  theme_apa() +
+  ggsci::scale_color_lancet(name = "Group") +
+  theme(legend.position = c(.9, .8),
+        legend.key = element_rect(fill = "white"),
+        legend.key.size = unit(1.5, "cm"),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(size = 16),
+        legend.title.align = .5,
+        legend.spacing.y = unit(.1, "cm")) +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+  
+# girafe(ggobj = plot) 
+# 
+# ggsave("plots/ltept-individual-curves-by-group.png",
+#        plot = last_plot(),
+#        device = "png",
+#        dpi = 300,
+#        height = 10,
+#        width = 14)
+```
+
+Mean Demand Curves
+
+```{r}
+
+#fit to mean curve should be used for display purposes only (See Kaplan 2021 
+# on mixed effects models for demand data)
+mn_ltept_fits <- ltept_data |> 
+  filter(id %in% ltept_sys_passing_ids & id %in% ltept_cc_passing_ids) |>
+  group_by(group, x) |> 
+  summarise(mn_y = mean(y)) |> 
+  FitCurves("koff",
+            xcol = "x",
+            ycol = "mn_y",
+            idcol = "group",
+            hibound = c("q0" = 100, "alpha" = Inf),
+            detailed = TRUE)
+
+mn_ltept_fits$newdats |> 
+  imap_dfr(~ tibble(Group = .y, select(.x, id, x, y))) |> 
+  mutate(Group = case_when(
+    Group == "eft" ~ "EFT",
+    Group == "hit" ~ "HIT")) |> 
+  ggplot(aes(x = x, y = y, color = Group)) +
+  geom_point(aes(x = x, y = mn_y), data = ltept_data |>
+               filter(id %in% ltept_sys_passing_ids & id %in%
+                        ltept_cc_passing_ids) |>
+               group_by(group, x) |> 
+               summarise(mn_y = mean(y)) |> 
+               rename(Group = group) |> 
+               mutate(Group = case_when(
+                 Group == "eft" ~ "EFT",
+                 Group == "hit" ~ "HIT"
+               ))) +
+  geom_line() +
+  coord_trans(x = "log10", xlim = c(1, 100),
+              ylim = c(0.1, 105)) +
+  scale_x_continuous(breaks = c(1, 1, 10, 100, 250),
+                labels = c("1", "1", "10", "100", "250")) +
+  scale_y_continuous(expand = c(.05, .05)) +
+  labs(x = "Leisure Time Traded for Exercise (%)",
+       y = "Likelihood of Trade",
+       title = "Leisure-time as Price Exercise Purchase Task (LT-EPT)",
+       subtitle = "Fit-to-group mean data") +
+       # subtitle = bquote(italic(n)*" EFT"~"="~.(n_eft_curves)*";"~italic(n)*" HIT"~"="~.(n_hit_curves))) + 
+  theme_apa() +
+  ggsci::scale_color_lancet(name = "Group") +
+  theme(legend.position = c(.9, .8),
+        legend.key = element_rect(fill = "white"),
+        legend.key.size = unit(3, "cm"),
+        legend.title = element_text(size = 16),
+        legend.title.align = .5,
+        legend.spacing.y = unit(.5, "cm"))
+
+# ggsave("plots/ltept-group-mean-curves.png",
+#        plot = last_plot(),
+#        device = "png",
+#        dpi = 1000,
+#        height = 10,
+#        width = 14)
+
+```
+
+Examine rates of failed CC and nonsys, for demand and DD
+
+```{r}
+#| label: nonsystematic-responses
+
+ltept_data |> 
+  CheckUnsystematic() |> 
+  filter(TotalPass == 3 | NumPosValues == 0) |> 
+  nrow()
+
+
+#function to count nonsys and sys demand responses. passing includes null/flat
+#demand at zero likelihood
+
+count_nonsys <- function(df) {
+# count number of total pass responses, but count those with 0 pos values as systematic
+  pass_n <- df |> 
+    beezdemand::CheckUnsystematic() |> # must be a tidy df with id, x, y columns
+    dplyr::filter(TotalPass == 3 | NumPosValues == 0) |> 
+    nrow()
+  
+# count number of fail, which is those with pos values above 0 but total pass less than 3
+  fail_n <- df |> 
+    beezdemand::CheckUnsystematic() |> 
+    dplyr::filter(NumPosValues > 0 & TotalPass <= 2) |> 
+    nrow()
+  
+# create df for df1 counts
+  sys_df <- tibble::tibble(pass_n, fail_n)
+ 
+ return(sys_df)
+}
+
+# fisher's exact using data from count_nonsys function on demand data
+bind_rows(count_nonsys(ltept_data |> 
+                         filter(group == "eft")),
+          count_nonsys(ltept_data |> 
+                         filter(group == "hit"))
+          ) |> 
+  fisher.test()
+
+
+# fisher's exact test using ltept comprehension check data
+bind_rows(table(data |>
+              filter(group == "eft") |> 
+              select(ltept_comp)),
+      table(data  |> 
+              filter(group == "hit") |> 
+              select(ltept_comp))) |> fisher.test()
+
+#count number of folks who provided nonsys demand data AND failed ltept comp check
+ltept_data |> 
+  beezdemand::CheckUnsystematic() |> 
+  left_join(x = _, y = data |>
+              select(id, group, ltept_comp) |>
+              mutate(id = as.character(id)),
+            by = "id") |> 
+      dplyr::filter(NumPosValues > 0 & TotalPass <= 2 & ltept_comp == 0)
+
+
+#count AC passing ids (at least 3 out of 4 passed) in the DD task
+count_ac_dd <- function(df, dd_ac_col) {
+  
+  pass_n  <- df |> 
+  filter({{dd_ac_col}} >= .75) |> 
+  distinct(id) |> 
+  nrow()
+  
+  fail_n <- df |> 
+  filter({{dd_ac_col}} <= .5) |> 
+  distinct(id) |> 
+  nrow()
+  
+  dd_ac_df <- tibble::tibble(pass_n, fail_n)
+
+  print(dd_ac_df)
+}
+
+#compare rates of DD attention check fails between groups
+bind_rows(count_ac_dd(dd_data |> 
+                        filter(group == "eft"), dd_ac),
+          count_ac_dd(dd_data |> 
+                        filter(group == "hit"), dd_ac)) |>
+  fisher.test()
+
+#compare rates of DD comprehension check fails between groups
+bind_rows(table(data |> 
+                  filter(group == "eft") |> 
+                  select(dd_comp)),
+          table(data |> 
+                  filter(group == "hit") |> 
+                  select(dd_comp))) |> 
+  fisher.test()
+
+# kruskal-wallace test to compare distributions of dd attention checks between groups
+kruskal.test(dd_ac ~ group, data = dd_ord)
+#can also use wilcoxon rank sum test (appropriate for just 2 groups)
+dd_ord |> 
+  wilcox.test(data = _, dd_ac ~ group)
+#finally, use an anova for fun
+dd_ord |> 
+  lm(data = _,
+     formula = dd_ac ~ group) |> 
+  car::Anova(type = 3)
+
+#examine differences in rates of generating null demand data between groups
+bind_cols(data |>
+            filter(id %in% ltept_zero_ids) |> # zero responses
+            select(id, group) |> 
+            group_by(group) |> 
+            summarise(n_zero = n()) |> 
+            select(-group), 
+          data |> 
+           filter(!id %in% ltept_zero_ids) |> # non-zero responses
+            select(id, group) |> 
+            group_by(group) |> 
+            summarise(n_nonzero = n()) |> 
+            select(-group)) |> 
+  fisher.test()
+
+```
+
